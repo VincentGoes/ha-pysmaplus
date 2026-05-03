@@ -4,11 +4,11 @@
   "codeowners": ["@littleyoda", "@kellerza", "@rklomp"],
   "config_flow": true,
   "dependencies": ["network"],
-  "documentation": "https://github.com/littleyoda/ha-pysmaplus",
+  "documentation": "https://github.com/VincentGoes/ha-pysmaplus",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/littleyoda/ha-pysmaplus/issues",
+  "issue_tracker": "https://github.com/VincentGoes/ha-pysmaplus/issues",
   "loggers": ["pysma"],
   "requirements": ["pysma-plus>=0.4.1"],
-  "version": "0.5.5"
+  "version": "0.5.6"
 }
