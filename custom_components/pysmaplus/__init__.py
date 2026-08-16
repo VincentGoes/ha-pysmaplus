@@ -166,12 +166,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryNotReady:
         await sma.close_session()
+        for _attr in ("_transport", "_protocol"):
+            try:
+                setattr(sma, _attr, None)
+            except Exception:
+                pass
         raise
 
     # Ensure we logout on shutdown
     async def async_close_session(event):
         """Close the session."""
         await sma.close_session()
+        # pysma-plus close_session() has a typo (_trasport vs _transport) that
+        # leaves the transport reference alive. Clear both attrs so the
+        # Speedwire slot is released cleanly before shutdown and does not
+        # collide with the next HA start's new session.
+        for _attr in ("_transport", "_protocol"):
+            try:
+                setattr(sma, _attr, None)
+            except Exception:
+                pass
 
     remove_stop_listener = hass.bus.async_listen_once(
         EVENT_HOMEASSISTANT_STOP, async_close_session
@@ -200,6 +214,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         data = hass.data[DOMAIN].pop(entry.entry_id)
         await data[PYSMA_OBJECT].close_session()
+        for _attr in ("_transport", "_protocol"):
+            try:
+                setattr(data[PYSMA_OBJECT], _attr, None)
+            except Exception:
+                pass
         data[PYSMA_REMOVE_LISTENER]()
 
     return unload_ok
