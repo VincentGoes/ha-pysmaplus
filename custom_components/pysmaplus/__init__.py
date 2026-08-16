@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 import logging
 from typing import TYPE_CHECKING, Any
@@ -46,8 +47,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-async def getPysmaInstance(hass: HomeAssistant, data: dict[str, Any]) -> Device:
-    """Returns a pysma Instance"""
+async def _create_sma_device(hass: HomeAssistant, data: dict[str, Any]) -> Device:
+    """Creates and configures a pysmaplus device object without establishing a session."""
     url = None
     session = None
     if data[CONF_ACCESS] == "speedwireinv" or data[CONF_ACCESS] == "speedwireinvV2":
@@ -79,10 +80,13 @@ async def getPysmaInstance(hass: HomeAssistant, data: dict[str, Any]) -> Device:
 
     # Options for Speedwire
     if am == "speedwireinv":
+        # set_options replaces the entire dict, so build it in one call
+        options: dict = {"overallTimeout": 15}  # default 5s is too tight; inverters take 3-5s
         retries = data.get(CONF_RETRIES, 0)
         if (retries > 0):
-            _LOGGER.error(f"Login retries: {retries}") 
-            sma.set_options({"loginRetries": retries})
+            _LOGGER.info(f"Login retries: {retries}")
+            options["loginRetries"] = retries
+        sma.set_options(options)
 
     # Adding Bindingaddresses for energy meter multicast
     if am == "speedwireem":
@@ -93,28 +97,74 @@ async def getPysmaInstance(hass: HomeAssistant, data: dict[str, Any]) -> Device:
                 addrs.append(ip_info["address"])
         _LOGGER.info("Binding Addr: " + ",".join(addrs))
         sma.set_options({"bindingaddr": ",".join(addrs)})
-    await sma.new_session()
     return sma
+
+
+async def getPysmaInstance(hass: HomeAssistant, data: dict[str, Any]) -> Device:
+    """Returns a connected pysma Instance."""
+    sma = await _create_sma_device(hass, data)
+    last_exc = None
+    for attempt in range(3):
+        try:
+            await sma.new_session()
+            return sma
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                _LOGGER.warning(f"Session attempt {attempt + 1}/3 failed ({type(exc).__name__}: {exc}), retrying in 3s...")
+                await asyncio.sleep(3)
+    raise last_exc
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up sma from a config entry."""
-    try:
-        # Init the SMA interface (getPysmaInstance already opens a session)
-        sma = await getPysmaInstance(hass, entry.data)
-        # Start seession/Test connection
-        await sma.new_session()
-        # Get updated device info
-        device_list = await sma.device_list()
-        sma_device_info = device_list[entry.data[CONF_DEVICE]]
-        # Get all device sensors
-        sensor_def = await sma.get_sensors(entry.data[CONF_DEVICE])
-    except (
-        pysma.exceptions.SmaReadException,
-        pysma.exceptions.SmaConnectionException,
-        TimeoutError,
-    ) as exc:
-        raise ConfigEntryNotReady from exc
+    sma = await _create_sma_device(hass, entry.data)
+    sma_device_info = None
+    sensor_def = None
+    last_exc = None
+
+    for attempt in range(5):
+        try:
+            await sma.new_session()
+            device_list = await sma.device_list()
+            sma_device_info = device_list[entry.data[CONF_DEVICE]]
+            _LOGGER.info(
+                f"Device info: name={sma_device_info.name}, type={sma_device_info.type}, serial={sma_device_info.serial}"
+            )
+            # On a cold boot the inverter sometimes returns SusyId=0 ("Unknown device (0)").
+            # Retry so we get the real device info and the correct sensor list.
+            if "Unknown" in (sma_device_info.name or "") or "Unknown" in (sma_device_info.type or ""):
+                raise Exception(
+                    f"Incomplete device info returned ({sma_device_info.name}/{sma_device_info.type}), will retry"
+                )
+            sensor_def = await sma.get_sensors(entry.data[CONF_DEVICE])
+            _LOGGER.info(
+                f"Setup successful, {len(sensor_def)} sensors loaded: "
+                + ", ".join(s.name for s in sensor_def)
+            )
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            _LOGGER.warning(f"Setup attempt {attempt + 1}/5 failed ({type(exc).__name__}: {exc}), retrying in 10s...")
+            try:
+                await sma.close_session()
+            except Exception:
+                pass
+            # pysmaplus close_session() has a typo (_trasport vs _transport) that
+            # leaves the transport reference alive. Clear both attrs so a fresh
+            # endpoint is created for the next attempt (no leftover Speedwire slot).
+            for _attr in ("_transport", "_protocol"):
+                try:
+                    setattr(sma, _attr, None)
+                except Exception:
+                    pass
+            if attempt < 4:
+                await asyncio.sleep(10)
+                sma = await _create_sma_device(hass, entry.data)
+
+    if last_exc is not None:
+        raise ConfigEntryNotReady from last_exc
 
     if TYPE_CHECKING:
         assert entry.unique_id
@@ -125,25 +175,58 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         configuration_url=None,
         identifiers={(DOMAIN, entry.unique_id)},
         manufacturer=sma_device_info.manufacturer,
-        model=str(sma_device_info.type),
+        model=sma_device_info.type,
         name=sma_device_info.name,
         sw_version=sma_device_info.sw_version,
     )
 
+    consecutive_failures = 0
+
     # Define the coordinator
     async def async_update_data():
         """Update the used SMA sensors."""
+        nonlocal sma, consecutive_failures
         try:
             _LOGGER.info(f"Update pysma {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}")
             await sma.read(sensor_def, entry.data[CONF_DEVICE])
+            consecutive_failures = 0
         except (
             pysma.exceptions.SmaReadException,
             pysma.exceptions.SmaConnectionException,
             TimeoutError
         ) as exc:
-            _LOGGER.warning(f"Update Failed {type(exc)} {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}")
-            _LOGGER.warning(exc, exc_info=True)
-            raise UpdateFailed(exc) from exc
+            _LOGGER.warning(f"Update Failed {type(exc)} {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}, attempting reconnect...")
+            try:
+                try:
+                    await sma.close_session()
+                except Exception:
+                    pass
+                # pysmaplus close_session() has a typo (_trasport vs _transport) that
+                # leaves the transport reference alive, causing zombie socket sends.
+                # Clear both attrs so the new session starts from a clean state.
+                for _attr in ("_transport", "_protocol"):
+                    try:
+                        setattr(sma, _attr, None)
+                    except Exception:
+                        pass
+                # Give the inverter 2 s to release its session slot after logoff,
+                # reducing interference from in-flight retransmit packets.
+                await asyncio.sleep(2)
+                sma = await getPysmaInstance(hass, entry.data)
+                if entry.entry_id in hass.data.get(DOMAIN, {}):
+                    hass.data[DOMAIN][entry.entry_id][PYSMA_OBJECT] = sma
+                await sma.read(sensor_def, entry.data[CONF_DEVICE])
+                _LOGGER.info(f"Reconnect successful {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}")
+                consecutive_failures = 0
+            except Exception as reconnect_exc:
+                consecutive_failures += 1
+                _LOGGER.warning(f"Reconnect also failed ({consecutive_failures}) {type(reconnect_exc)} {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}")
+                _LOGGER.warning(exc, exc_info=True)
+                if consecutive_failures >= 3:
+                    _LOGGER.warning(f"Scheduling config entry reload after {consecutive_failures} consecutive failures {entry.data[CONF_HOST]}")
+                    consecutive_failures = 0
+                    hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
+                raise UpdateFailed(exc) from exc
         except Exception as e:
             _LOGGER.warning(f"Update Failed. Unfetched Exception {type(e)} {entry.data[CONF_HOST]}/{entry.data[CONF_ACCESS]}/{entry.data[CONF_DEVICE]}")
 
@@ -159,28 +242,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         name="pysmaplus",
         update_method=async_update_data,
         update_interval=interval,
-        always_update=True,
     )
 
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryNotReady:
         await sma.close_session()
-        for _attr in ("_transport", "_protocol"):
-            try:
-                setattr(sma, _attr, None)
-            except Exception:
-                pass
         raise
 
     # Ensure we logout on shutdown
     async def async_close_session(event):
         """Close the session."""
         await sma.close_session()
-        # pysma-plus close_session() has a typo (_trasport vs _transport) that
-        # leaves the transport reference alive. Clear both attrs so the
-        # Speedwire slot is released cleanly before shutdown and does not
-        # collide with the next HA start's new session.
+        # Clear the transport/protocol refs (close_session() typo leaves them
+        # alive) so the Speedwire slot is released cleanly before shutdown and
+        # does not collide with the next HA start's new session.
         for _attr in ("_transport", "_protocol"):
             try:
                 setattr(sma, _attr, None)
@@ -203,6 +279,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # The first coordinator refresh ran before entities were subscribed, so they
+    # never received a callback.  Refresh again now so all entities immediately
+    # get fresh data pushed via the coordinator, instead of waiting scan_interval
+    # seconds and showing stale/unavailable state restored from the DB.
+    await coordinator.async_refresh()
+
     setup_services(hass)
 
     return True
